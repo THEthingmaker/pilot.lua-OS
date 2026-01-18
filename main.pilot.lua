@@ -826,7 +826,11 @@ local function executeEZ(code, filename)
         elseif line:match("^wait%s") then
             local ms = line:match("^wait%s+(%d+)$")
             if ms then
-                printLine("(waiting " .. ms .. "ms...)", Color3.new(0.5, 0.5, 0.5))
+                local msNum = tonumber(ms) or 0
+                -- Convert milliseconds to seconds for Roblox wait()
+                if msNum > 0 then
+                    wait(msNum / 1000)
+                end
             end
             pc = pc + 1
             
