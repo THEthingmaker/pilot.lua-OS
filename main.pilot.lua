@@ -313,110 +313,821 @@ local currentInput = ""
 -- ===== EasyExec (.ez) Interpreter =====
 local function executeEZ(code, filename)
     local lines = {}
-    for line in code:gmatch("[^\r\n]+") do
+    for line in code:gmatch("[^\r\n]+") do 
         table.insert(lines, line)
     end
     
     local vars = {}
+    local arrays = {}  -- Array storage
+    local functions = {}
+    local callStack = {}
+    local labels = {}  -- Label mapping
     local pc = 1
-    local maxIterations = 10000
+    local maxIterations = 100000
     local iterations = 0
+    local breakFlag = false
+    local continueFlag = false
     
-    printLine("--- Running " .. filename .. " ---", Color3.new(0, 0.8, 1))
+    -- Helper functions
+    local function safeNum(val) 
+        local n = tonumber(val)
+        if n then return n end
+        -- Try resolving as variable
+        if vars[val] and type(vars[val]) == "number" then return vars[val] end
+        return 0
+    end
     
-    while pc <= #lines do
+    local function resolveValue(val)
+        -- Handle variable references
+        if vars[val] ~= nil then return vars[val] end
+        -- Handle string literals
+        if val:sub(1,1) == '"' and val:sub(-1,-1) == '"' then
+            return val:sub(2, -2)
+        end
+        -- Handle numbers
+        local num = tonumber(val)
+        if num then return num end
+        -- Handle booleans
+        if val == "true" then return true end
+        if val == "false" then return false end
+        return val
+    end
+    
+    local function evaluateExpression(expr)
+        -- Handle simple math expressions
+        expr = expr:gsub("{([^}]+)}", function(v) return tostring(vars[v] or 0) end)
+        local success, result = pcall(function() return load("return " .. expr)() end)
+        if success then return result end
+        return resolveValue(expr)
+    end
+    
+    local function evaluateCondition(cond)
+        -- Parse complex conditions with and/or/not
+        local function evalSimple(s)
+            s = s:match("^%s*(.-)%s*$")
+            
+            -- Handle 'not' prefix
+            if s:sub(1,4) == "not " then
+                return not evalSimple(s:sub(5))
+            end
+            
+            -- Check for comparison operators
+            local var, op, val = s:match("^(%w+)%s*([<>=!]+)%s*(.+)$")
+            if var then
+                local left = vars[var]
+                if left == nil then return false end
+                local right = evaluateExpression(val)
+                
+                if type(left) == "number" and type(right) == "number" then
+                    if op == "==" or op == "=" then return left == right
+                    elseif op == "!=" then return left ~= right
+                    elseif op == "<" then return left < right
+                    elseif op == ">" then return left > right
+                    elseif op == "<=" then return left <= right
+                    elseif op == ">=" then return left >= right end
+                else
+                    if op == "==" or op == "=" then return left == right
+                    elseif op == "!=" then return left ~= right end
+                end
+            end
+            
+            -- Check for truthiness
+            local v = vars[s]
+            if v ~= nil then
+                if type(v) == "boolean" then return v end
+                if type(v) == "number" then return v ~= 0 end
+                if type(v) == "string" then return v ~= "" end
+            end
+            return false
+        end
+        
+        -- Handle 'and' operator
+        if cond:find(" and ") then
+            for part in cond:gmatch("[^and]+") do
+                if not evalSimple(part) then return false end
+            end
+            return true
+        end
+        
+        -- Handle 'or' operator
+        if cond:find(" or ") then
+            for part in cond:gmatch("[^or]+") do
+                if evalSimple(part) then return true end
+            end
+            return false
+        end
+        
+        return evalSimple(cond)
+    end
+    
+    -- Pre-scan for labels and functions
+    for i = 1, #lines do
+        local line = lines[i]:match("^%s*(.-)%s*$")
+        
+        -- Find labels
+        local label = line:match("^:(%w+)$")
+        if label then
+            labels[label] = i
+        end
+        
+        -- Find functions
+        local fname, params = line:match("^func%s+(%w+)(.*)$")
+        if fname then
+            local paramList = {}
+            if params and params ~= "" then
+                for param in params:gmatch("%w+") do
+                    table.insert(paramList, param)
+                end
+            end
+            functions[fname] = {start = i + 1, params = paramList}
+        end
+    end
+    
+    printLine("=== EasyExec v3.0 Enhanced - " .. filename .. " ===", Color3.new(0, 1, 0))
+    
+    while pc <= #lines and pc > 0 do
         iterations = iterations + 1
         if iterations > maxIterations then
-            printLine("Error: Program exceeded max iterations", Color3.new(1, 0, 0))
+            printLine("FATAL: Execution limit exceeded", Color3.new(1, 0, 0))
             break
         end
         
-        local line = lines[pc]:match("^%s*(.-)%s*$") -- trim
+        if breakFlag then break end
+        if continueFlag then
+            continueFlag = false
+            -- Find next endloop
+            local depth = 1
+            while pc <= #lines do
+                pc = pc + 1
+                local l = lines[pc]:match("^%s*(.-)%s*$")
+                if l:match("^loop%s") or l:match("^while%s") or l:match("^for%s") then
+                    depth = depth + 1
+                elseif l == "endloop" or l == "endwhile" or l == "endfor" then
+                    depth = depth - 1
+                    if depth == 0 then break end
+                end
+            end
+        end
         
-        if line == "" or line:sub(1,1) == "#" then
-            -- Comment or empty
+        local line = lines[pc]:match("^%s*(.-)%s*$")
+        
+        -- Skip empty lines and comments
+        if line == "" or line:sub(1,1) == "#" or line:sub(1,2) == "--" then
             pc = pc + 1
-        elseif line:sub(1,5) == "print" then
-            local msg = line:sub(7)
-            msg = msg:gsub("{(%w+)}", function(v) return tostring(vars[v] or "nil") end)
+            
+        -- Labels (skip them during execution)
+        elseif line:match("^:%w+$") then
+            pc = pc + 1
+            
+        -- Variable assignment: set var value
+        elseif line:match("^set%s") then
+            local var, value = line:match("^set%s+(%w+)%s+(.*)$")
+            if var then
+                vars[var] = evaluateExpression(value)
+            end
+            pc = pc + 1
+            
+        -- Increment/decrement: inc var [amount], dec var [amount]
+        elseif line:match("^inc%s") or line:match("^dec%s") then
+            local op, var, amount = line:match("^(%w+)%s+(%w+)%s*(.*)$")
+            if var and vars[var] and type(vars[var]) == "number" then
+                local amt = amount ~= "" and safeNum(amount) or 1
+                if op == "inc" then
+                    vars[var] = vars[var] + amt
+                else
+                    vars[var] = vars[var] - amt
+                end
+            end
+            pc = pc + 1
+            
+        -- Print with variable substitution
+        elseif line:match("^print%s") then
+            local msg = line:match("^print%s+(.*)$")
+            msg = msg:gsub("{([^}]+)}", function(v)
+                local val = vars[v]
+                if type(val) == "string" then return val
+                elseif val ~= nil then return tostring(val)
+                else return "nil" end
+            end)
             printLine(msg)
             pc = pc + 1
-        elseif line:sub(1,3) == "set" then
-            local var, val = line:match("^set%s+(%w+)%s+(.+)$")
-            if var then
-                local num = tonumber(val)
-                vars[var] = num or val
-            end
-            pc = pc + 1
-        elseif line:sub(1,3) == "add" then
-            local var, val = line:match("^add%s+(%w+)%s+(.+)$")
-            if var and vars[var] then
-                vars[var] = (tonumber(vars[var]) or 0) + (tonumber(val) or 0)
-            end
-            pc = pc + 1
-        elseif line:sub(1,3) == "sub" then
-            local var, val = line:match("^sub%s+(%w+)%s+(.+)$")
-            if var and vars[var] then
-                vars[var] = (tonumber(vars[var]) or 0) - (tonumber(val) or 0)
-            end
-            pc = pc + 1
-        elseif line:sub(1,3) == "mul" then
-            local var, val = line:match("^mul%s+(%w+)%s+(.+)$")
-            if var and vars[var] then
-                vars[var] = (tonumber(vars[var]) or 0) * (tonumber(val) or 0)
-            end
-            pc = pc + 1
-        elseif line:sub(1,3) == "div" then
-            local var, val = line:match("^div%s+(%w+)%s+(.+)$")
-            if var and vars[var] then
-                local divisor = tonumber(val) or 1
-                if divisor ~= 0 then
-                    vars[var] = (tonumber(vars[var]) or 0) / divisor
+            
+        -- Math operations: add/sub/mul/div/mod/pow var value
+        elseif line:match("^(%w+)%s+(%w+)%s") then
+            local op, var, value = line:match("^(%w+)%s+(%w+)%s+(.+)$")
+            if var and vars[var] ~= nil and type(vars[var]) == "number" then
+                local current = vars[var]
+                local operand = evaluateExpression(value)
+                if type(operand) ~= "number" then operand = 0 end
+                
+                if op == "add" then vars[var] = current + operand
+                elseif op == "sub" then vars[var] = current - operand
+                elseif op == "mul" then vars[var] = current * operand
+                elseif op == "div" and operand ~= 0 then vars[var] = current / operand
+                elseif op == "mod" and operand ~= 0 then vars[var] = current % operand
+                elseif op == "pow" then vars[var] = current ^ operand
+                elseif op == "min" then vars[var] = math.min(current, operand)
+                elseif op == "max" then vars[var] = math.max(current, operand)
                 else
-                    printLine("Error: Division by zero", Color3.new(1, 0, 0))
+                    pc = pc + 1
                 end
             end
             pc = pc + 1
-        elseif line:sub(1,2) == "if" then
-            local rest = line:sub(4)
-            local var, op, val, gotoLine = rest:match("^%s*(%w+)%s*([<>=!]+)%s*(%S+)%s+goto%s+(%d+)$")
-            if var and op and val then
-                local varVal = tonumber(vars[var]) or 0
-                local cmpVal = tonumber(val) or 0
-                local condition = false
-                
-                if op == "==" or op == "=" then condition = (varVal == cmpVal)
-                elseif op == "!=" or op == "<>" then condition = (varVal ~= cmpVal)
-                elseif op == "<" then condition = (varVal < cmpVal)
-                elseif op == ">" then condition = (varVal > cmpVal)
-                elseif op == "<=" then condition = (varVal <= cmpVal)
-                elseif op == ">=" then condition = (varVal >= cmpVal)
+            
+        -- Block-based if statement: if condition {
+        elseif line:match("^if%s+.+{$") then
+            local cond = line:match("^if%s+(.+){$")
+            local result = evaluateCondition(cond)
+            
+            if not result then
+                -- Skip to closing brace or else
+                local depth = 1
+                while pc < #lines do
+                    pc = pc + 1
+                    local l = lines[pc]:match("^%s*(.-)%s*$")
+                    if l:match("{$") then depth = depth + 1
+                    elseif l == "}" then
+                        depth = depth - 1
+                        if depth == 0 then break end
+                    elseif l == "else" and depth == 1 then
+                        break
+                    end
                 end
-                
-                if condition then
-                    pc = tonumber(gotoLine) or (pc + 1)
+            end
+            pc = pc + 1
+            
+        -- Else block
+        elseif line == "else" then
+            -- Skip to closing brace
+            local depth = 1
+            while pc < #lines do
+                pc = pc + 1
+                local l = lines[pc]:match("^%s*(.-)%s*$")
+                if l:match("{$") then depth = depth + 1
+                elseif l == "}" then
+                    depth = depth - 1
+                    if depth == 0 then break end
+                end
+            end
+            pc = pc + 1
+            
+        -- Closing brace
+        elseif line == "}" then
+            pc = pc + 1
+            
+        -- While loop: while condition {
+        elseif line:match("^while%s+.+{$") then
+            local cond = line:match("^while%s+(.+){$")
+            local loopStart = pc
+            
+            if evaluateCondition(cond) then
+                callStack[#callStack+1] = {type="while", start=loopStart, cond=cond}
+                pc = pc + 1
+            else
+                -- Skip to endwhile
+                local depth = 1
+                while pc < #lines do
+                    pc = pc + 1
+                    local l = lines[pc]:match("^%s*(.-)%s*$")
+                    if l:match("^while%s") then depth = depth + 1
+                    elseif l == "endwhile" then
+                        depth = depth - 1
+                        if depth == 0 then break end
+                    end
+                end
+                pc = pc + 1
+            end
+            
+        -- End while
+        elseif line == "endwhile" then
+            if #callStack > 0 and callStack[#callStack].type == "while" then
+                local loop = callStack[#callStack]
+                if evaluateCondition(loop.cond) then
+                    pc = loop.start + 1
                 else
+                    table.remove(callStack)
                     pc = pc + 1
                 end
             else
                 pc = pc + 1
             end
-        elseif line:sub(1,4) == "goto" then
-            local lineNum = line:match("^goto%s+(%d+)$")
-            if lineNum then
-                pc = tonumber(lineNum)
+            
+        -- For loop: for var start end [step]
+        elseif line:match("^for%s") then
+            local var, startVal, endVal, step = line:match("^for%s+(%w+)%s+(.-)%s+to%s+(.-)%s*step%s*(.*)$")
+            if not var then
+                var, startVal, endVal = line:match("^for%s+(%w+)%s+(.-)%s+to%s+(.*)$")
+                step = "1"
+            end
+            
+            if var then
+                local s = safeNum(startVal)
+                local e = safeNum(endVal)
+                local st = step and safeNum(step) or 1
+                vars[var] = s
+                callStack[#callStack+1] = {type="for", var=var, current=s, endVal=e, step=st, start=pc}
+                pc = pc + 1
             else
                 pc = pc + 1
             end
-        elseif line:sub(1,3) == "end" then
-            break
+            
+        -- End for
+        elseif line == "endfor" then
+            if #callStack > 0 and callStack[#callStack].type == "for" then
+                local loop = callStack[#callStack]
+                loop.current = loop.current + loop.step
+                vars[loop.var] = loop.current
+                
+                local shouldContinue = (loop.step > 0 and loop.current <= loop.endVal) or
+                                      (loop.step < 0 and loop.current >= loop.endVal)
+                
+                if shouldContinue then
+                    pc = loop.start + 1
+                else
+                    table.remove(callStack)
+                    pc = pc + 1
+                end
+            else
+                pc = pc + 1
+            end
+            
+        -- Break statement
+        elseif line == "break" then
+            -- Pop loop from stack
+            if #callStack > 0 then
+                local loopType = callStack[#callStack].type
+                table.remove(callStack)
+                
+                -- Skip to end of loop
+                local depth = 1
+                while pc < #lines do
+                    pc = pc + 1
+                    local l = lines[pc]:match("^%s*(.-)%s*$")
+                    if loopType == "while" and l == "endwhile" and depth == 1 then break
+                    elseif loopType == "for" and l == "endfor" and depth == 1 then break
+                    end
+                end
+            end
+            pc = pc + 1
+            
+        -- Continue statement
+        elseif line == "continue" then
+            if #callStack > 0 then
+                local loop = callStack[#callStack]
+                if loop.type == "for" then
+                    -- Jump to endfor to increment
+                    local depth = 1
+                    while pc < #lines do
+                        pc = pc + 1
+                        local l = lines[pc]:match("^%s*(.-)%s*$")
+                        if l:match("^for%s") then depth = depth + 1
+                        elseif l == "endfor" then
+                            depth = depth - 1
+                            if depth == 0 then break end
+                        end
+                    end
+                elseif loop.type == "while" then
+                    -- Jump to endwhile to check condition
+                    local depth = 1
+                    while pc < #lines do
+                        pc = pc + 1
+                        local l = lines[pc]:match("^%s*(.-)%s*$")
+                        if l:match("^while%s") then depth = depth + 1
+                        elseif l == "endwhile" then
+                            depth = depth - 1
+                            if depth == 0 then break end
+                        end
+                    end
+                end
+            else
+                pc = pc + 1
+            end
+            
+        -- Goto with labels: goto labelname
+        elseif line:match("^goto%s") then
+            local target = line:match("^goto%s+(%w+)$")
+            if target then
+                -- Try label first
+                if labels[target] then
+                    pc = labels[target] + 1
+                else
+                    -- Try line number
+                    pc = safeNum(target)
+                end
+            else
+                pc = pc + 1
+            end
+            
+        -- Array operations: array name size OR array name [val1, val2, ...]
+        elseif line:match("^array%s") then
+            local name, rest = line:match("^array%s+(%w+)%s+(.*)$")
+            if name then
+                if rest:match("^%[.+%]$") then
+                    -- Initialize with values
+                    local values = rest:sub(2, -2)
+                    arrays[name] = {}
+                    for val in values:gmatch("[^,]+") do
+                        table.insert(arrays[name], evaluateExpression(val:match("^%s*(.-)%s*$")))
+                    end
+                else
+                    -- Initialize with size
+                    local size = safeNum(rest)
+                    arrays[name] = {}
+                    for i = 1, size do
+                        arrays[name][i] = 0
+                    end
+                end
+            end
+            pc = pc + 1
+            
+        -- Array access: get var array[index]
+        elseif line:match("^get%s") then
+            local var, arr, idx = line:match("^get%s+(%w+)%s+(%w+)%[(.+)%]$")
+            if var and arr and arrays[arr] then
+                local index = safeNum(idx)
+                vars[var] = arrays[arr][index] or 0
+            end
+            pc = pc + 1
+            
+        -- Array set: put array[index] value
+        elseif line:match("^put%s") then
+            local arr, idx, val = line:match("^put%s+(%w+)%[(.+)%]%s+(.+)$")
+            if arr and arrays[arr] then
+                local index = safeNum(idx)
+                arrays[arr][index] = evaluateExpression(val)
+            end
+            pc = pc + 1
+            
+        -- Array length: len var array
+        elseif line:match("^len%s") then
+            local var, arr = line:match("^len%s+(%w+)%s+(%w+)$")
+            if var and arr and arrays[arr] then
+                vars[var] = #arrays[arr]
+            end
+            pc = pc + 1
+            
+        -- Array push: push array value
+        elseif line:match("^push%s") then
+            local arr, val = line:match("^push%s+(%w+)%s+(.+)$")
+            if arr and arrays[arr] then
+                table.insert(arrays[arr], evaluateExpression(val))
+            end
+            pc = pc + 1
+            
+        -- Array pop: pop var array
+        elseif line:match("^pop%s") then
+            local var, arr = line:match("^pop%s+(%w+)%s+(%w+)$")
+            if var and arr and arrays[arr] then
+                vars[var] = table.remove(arrays[arr]) or 0
+            end
+            pc = pc + 1
+            
+        -- String length: strlen var string
+        elseif line:match("^strlen%s") then
+            local var, str = line:match("^strlen%s+(%w+)%s+(.+)$")
+            if var then
+                local s = resolveValue(str)
+                vars[var] = #tostring(s)
+            end
+            pc = pc + 1
+            
+        -- String concatenation: concat var str1 str2
+        elseif line:match("^concat%s") then
+            local var, s1, s2 = line:match("^concat%s+(%w+)%s+(%S+)%s+(.+)$")
+            if var then
+                local str1 = tostring(resolveValue(s1))
+                local str2 = tostring(resolveValue(s2))
+                vars[var] = str1 .. str2
+            end
+            pc = pc + 1
+            
+        -- Substring: substr var string start [length]
+        elseif line:match("^substr%s") then
+            local var, str, start, len = line:match("^substr%s+(%w+)%s+(%S+)%s+(%d+)%s*(%d*)$")
+            if var and str then
+                local s = tostring(resolveValue(str))
+                local st = safeNum(start)
+                local ln = len ~= "" and safeNum(len) or #s
+                vars[var] = s:sub(st, st + ln - 1)
+            end
+            pc = pc + 1
+            
+        -- Random number: rand var min max
+        elseif line:match("^rand%s") then
+            local var, min, max = line:match("^rand%s+(%w+)%s+(.-)%s+(.+)$")
+            if var then
+                local minVal = safeNum(min)
+                local maxVal = safeNum(max)
+                vars[var] = math.random(minVal, maxVal)
+            end
+            pc = pc + 1
+            
+        -- Sleep/wait: wait milliseconds
+        elseif line:match("^wait%s") then
+            local ms = line:match("^wait%s+(%d+)$")
+            if ms then
+                printLine("(waiting " .. ms .. "ms...)", Color3.new(0.5, 0.5, 0.5))
+            end
+            pc = pc + 1
+            
+        -- Function definition
+        elseif line:match("^func%s") then
+            -- Skip to end
+            local depth = 1
+            while pc < #lines do
+                pc = pc + 1
+                local l = lines[pc]:match("^%s*(.-)%s*$")
+                if l:match("^func%s") then depth = depth + 1
+                elseif l == "endfunc" then
+                    depth = depth - 1
+                    if depth == 0 then break end
+                end
+            end
+            pc = pc + 1
+            
+        -- Function call: call funcname [args...]
+        elseif line:match("^call%s") then
+            local fname, args = line:match("^call%s+(%w+)%s*(.*)$")
+            if functions[fname] then
+                -- Save current vars (simple scope)
+                local savedVars = {}
+                for k, v in pairs(vars) do savedVars[k] = v end
+                
+                -- Parse arguments
+                local argList = {}
+                if args ~= "" then
+                    for arg in args:gmatch("%S+") do
+                        table.insert(argList, evaluateExpression(arg))
+                    end
+                end
+                
+                -- Set parameters
+                for i, param in ipairs(functions[fname].params) do
+                    vars[param] = argList[i] or 0
+                end
+                
+                callStack[#callStack+1] = {type="function", returnTo=pc+1, savedVars=savedVars}
+                pc = functions[fname].start
+            else
+                printLine("ERROR: Function not found: " .. fname, Color3.new(1, 0.5, 0))
+                pc = pc + 1
+            end
+            
+        -- Return from function
+        elseif line == "return" or line == "endfunc" then
+            if #callStack > 0 and callStack[#callStack].type == "function" then
+                local func = callStack[#callStack]
+                -- Restore vars
+                vars = func.savedVars
+                table.remove(callStack)
+                pc = func.returnTo
+            else
+                break
+            end
+            
+        -- Input: input var prompt
+        elseif line:match("^input%s") then
+            local var, prompt = line:match("^input%s+(%w+)%s+(.+)$")
+            if var then
+                printLine("INPUT: " .. prompt, Color3.new(0.8, 0.8, 0))
+                vars[var] = ""  -- Placeholder for actual input
+            end
+            pc = pc + 1
+            
+        -- Type conversion: int var value OR str var value
+        elseif line:match("^int%s") then
+            local var, val = line:match("^int%s+(%w+)%s+(.+)$")
+            if var then
+                vars[var] = math.floor(safeNum(val))
+            end
+            pc = pc + 1
+            
+        elseif line:match("^str%s") then
+            local var, val = line:match("^str%s+(%w+)%s+(.+)$")
+            if var then
+                vars[var] = tostring(resolveValue(val))
+            end
+            pc = pc + 1
+            
+        -- Boolean operations: bool var value
+        elseif line:match("^bool%s") then
+            local var, val = line:match("^bool%s+(%w+)%s+(.+)$")
+            if var then
+                local v = resolveValue(val)
+                if type(v) == "boolean" then vars[var] = v
+                elseif type(v) == "number" then vars[var] = v ~= 0
+                elseif type(v) == "string" then vars[var] = v ~= ""
+                else vars[var] = false end
+            end
+            pc = pc + 1
+            
+        -- Absolute value: abs var value
+        elseif line:match("^abs%s") then
+            local var, val = line:match("^abs%s+(%w+)%s+(.+)$")
+            if var then
+                vars[var] = math.abs(safeNum(val))
+            end
+            pc = pc + 1
+            
+        -- Square root: sqrt var value
+        elseif line:match("^sqrt%s") then
+            local var, val = line:match("^sqrt%s+(%w+)%s+(.+)$")
+            if var then
+                local n = safeNum(val)
+                if n >= 0 then
+                    vars[var] = math.sqrt(n)
+                else
+                    printLine("ERROR: Cannot sqrt negative number", Color3.new(1, 0.5, 0))
+                end
+            end
+            pc = pc + 1
+            
+        -- Floor/Ceil: floor var value OR ceil var value
+        elseif line:match("^floor%s") then
+            local var, val = line:match("^floor%s+(%w+)%s+(.+)$")
+            if var then
+                vars[var] = math.floor(safeNum(val))
+            end
+            pc = pc + 1
+            
+        elseif line:match("^ceil%s") then
+            local var, val = line:match("^ceil%s+(%w+)%s+(.+)$")
+            if var then
+                vars[var] = math.ceil(safeNum(val))
+            end
+            pc = pc + 1
+            
+        -- Assert: assert condition message
+        elseif line:match("^assert%s") then
+            local cond, msg = line:match("^assert%s+(.-)%s+(.+)$")
+            if cond then
+                if not evaluateCondition(cond) then
+                    printLine("ASSERTION FAILED: " .. msg, Color3.new(1, 0, 0))
+                    break
+                end
+            end
+            pc = pc + 1
+            
+        -- Debug print: debug var
+        elseif line:match("^debug%s") then
+            local var = line:match("^debug%s+(%w+)$")
+            if var then
+                local val = vars[var]
+                local typeStr = type(val)
+                printLine("[DEBUG] " .. var .. " = " .. tostring(val) .. " (" .. typeStr .. ")", Color3.new(1, 1, 0))
+            end
+            pc = pc + 1
+            
+        -- Dump all variables
+        elseif line == "dump" then
+            printLine("=== Variable Dump ===", Color3.new(0.5, 1, 0.5))
+            for k, v in pairs(vars) do
+                printLine(k .. " = " .. tostring(v) .. " (" .. type(v) .. ")")
+            end
+            printLine("=== End Dump ===", Color3.new(0.5, 1, 0.5))
+            pc = pc + 1
+            
+        -- Swap two variables: swap var1 var2
+        elseif line:match("^swap%s") then
+            local v1, v2 = line:match("^swap%s+(%w+)%s+(%w+)$")
+            if v1 and v2 then
+                vars[v1], vars[v2] = vars[v2], vars[v1]
+            end
+            pc = pc + 1
+            
+        -- Clamp value: clamp var min max
+        elseif line:match("^clamp%s") then
+            local var, minVal, maxVal = line:match("^clamp%s+(%w+)%s+(.-)%s+(.+)$")
+            if var and vars[var] then
+                local val = vars[var]
+                local min = safeNum(minVal)
+                local max = safeNum(maxVal)
+                if type(val) == "number" then
+                    vars[var] = math.max(min, math.min(max, val))
+                end
+            end
+            pc = pc + 1
+            
+        -- Switch case (simplified): switch var
+        elseif line:match("^switch%s") then
+            local var = line:match("^switch%s+(%w+)$")
+            if var then
+                local switchVal = vars[var]
+                local matched = false
+                
+                -- Look for case statements
+                while pc < #lines do
+                    pc = pc + 1
+                    local l = lines[pc]:match("^%s*(.-)%s*$")
+                    
+                    if l:match("^case%s") then
+                        local caseVal = l:match("^case%s+(.+)$")
+                        if evaluateExpression(caseVal) == switchVal then
+                            matched = true
+                            pc = pc + 1
+                            break
+                        end
+                    elseif l == "default" then
+                        matched = true
+                        pc = pc + 1
+                        break
+                    elseif l == "endswitch" then
+                        break
+                    end
+                end
+                
+                if not matched then
+                    -- Skip to endswitch
+                    while pc < #lines do
+                        pc = pc + 1
+                        if lines[pc]:match("^%s*(.-)%s*$") == "endswitch" then
+                            break
+                        end
+                    end
+                end
+            end
+            pc = pc + 1
+            
+        -- Case in switch
+        elseif line:match("^case%s") then
+            -- Skip to next case or endswitch
+            while pc < #lines do
+                pc = pc + 1
+                local l = lines[pc]:match("^%s*(.-)%s*$")
+                if l:match("^case%s") or l == "default" or l == "endswitch" then
+                    pc = pc - 1
+                    break
+                end
+            end
+            pc = pc + 1
+            
+        -- Default case
+        elseif line == "default" then
+            pc = pc + 1
+            
+        -- End switch
+        elseif line == "endswitch" then
+            pc = pc + 1
+            
+        -- Try-catch block: try {
+        elseif line == "try {" then
+            callStack[#callStack+1] = {type="try", tryStart=pc}
+            pc = pc + 1
+            
+        -- Catch block: catch {
+        elseif line == "catch {" then
+            -- Skip catch if no error
+            if #callStack > 0 and callStack[#callStack].type == "try" then
+                table.remove(callStack)
+                -- Skip to end of catch
+                local depth = 1
+                while pc < #lines do
+                    pc = pc + 1
+                    local l = lines[pc]:match("^%s*(.-)%s*$")
+                    if l:match("{$") then depth = depth + 1
+                    elseif l == "}" then
+                        depth = depth - 1
+                        if depth == 0 then break end
+                    end
+                end
+            end
+            pc = pc + 1
+            
+        -- Throw error: throw message
+        elseif line:match("^throw%s") then
+            local msg = line:match("^throw%s+(.+)$")
+            printLine("ERROR THROWN: " .. msg, Color3.new(1, 0, 0))
+            -- Jump to catch if exists
+            if #callStack > 0 and callStack[#callStack].type == "try" then
+                while pc < #lines do
+                    pc = pc + 1
+                    if lines[pc]:match("^%s*(.-)%s*$") == "catch {" then
+                        break
+                    end
+                end
+            else
+                break
+            end
+            
+        -- Sleep comment (cosmetic)
+        elseif line:match("^sleep%s") then
+            local ms = line:match("^sleep%s+(%d+)$")
+            printLine("(sleeping " .. ms .. "ms)", Color3.new(0.4, 0.4, 0.4))
+            pc = pc + 1
+            
+        -- Comment
+        elseif line:match("^rem%s") or line:match("^comment%s") then
+            pc = pc + 1
+            
         else
-            printLine("Unknown command: " .. line, Color3.new(1, 0.5, 0))
+            printLine("ERROR: Unknown command '" .. line .. "' at line " .. pc, Color3.new(1, 0.5, 0))
             pc = pc + 1
         end
     end
     
-    printLine("--- Program finished ---", Color3.new(0, 0.8, 1))
+    printLine("=== Execution Complete ===", Color3.new(0, 1, 0))
+    printLine("Total iterations: " .. iterations, Color3.new(0.5, 0.5, 0.5))
+    return vars
 end
 
 -- ===== Command Handler =====
